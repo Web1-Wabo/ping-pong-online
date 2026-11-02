@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Ping Pong Online · Juega con un amigo por código de sala</title>
+  <meta name="description" content="Juego de ping pong online gratis en el navegador. Crea una sala, comparte el código y juega 1 contra 1 en tiempo real. También contra la CPU o 2 jugadores en el mismo teclado.">
+  <meta name="theme-color" content="#0b1d33">
+  <meta property="og:title" content="Ping Pong Online">
+  <meta property="og:description" content="Crea una sala, comparte el código y juega al ping pong en tiempo real con un amigo.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏓</text></svg>">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <main id="app">
+
+    <!-- MENÚ PRINCIPAL -->
+    <section id="menu" class="screen active" aria-labelledby="title">
+      <div class="card">
+        <h1 id="title"><span aria-hidden="true">🏓</span> Ping Pong <em>Online</em></h1>
+        <p class="tagline">Crea una sala, pasa el código a un amigo y a jugar. Partidos a 11 con las reglas del tenis de mesa.</p>
+
+        <label class="field">
+          <span>Tu nombre</span>
+          <input id="name" type="text" maxlength="14" placeholder="Jugador" autocomplete="nickname">
+        </label>
+
+        <div class="block">
+          <h2>Online 1 contra 1</h2>
+          <button id="btn-host" class="btn primary">Crear sala</button>
+          <div class="join-row">
+            <input id="join-code" type="text" maxlength="5" placeholder="CÓDIGO" aria-label="Código de sala" autocomplete="off" spellcheck="false">
+            <button id="btn-join" class="btn">Unirse</button>
+          </div>
+          <p id="menu-error" class="error" role="alert"></p>
+        </div>
+
+        <div class="block">
+          <h2>Sin conexión</h2>
+          <div class="row">
+            <button id="btn-cpu" class="btn">Contra la CPU</button>
+            <select id="cpu-level" aria-label="Dificultad de la CPU">
+              <option value="easy">Fácil</option>
+              <option value="normal" selected>Normal</option>
+              <option value="hard">Difícil</option>
+            </select>
+          </div>
+          <button id="btn-local" class="btn">2 jugadores · mismo dispositivo</button>
+        </div>
+
+        <details class="help">
+          <summary>Controles y reglas</summary>
+          <ul>
+            <li><b>Ratón / dedo:</b> mueve la pala arrastrando por tu mitad del campo.</li>
+            <li><b>Teclado:</b> <kbd>W</kbd>/<kbd>S</kbd> o <kbd>↑</kbd>/<kbd>↓</kbd>. En 2 jugadores locales: izquierda <kbd>W</kbd>/<kbd>S</kbd>, derecha <kbd>↑</kbd>/<kbd>↓</kbd>.</li>
+            <li><kbd>P</kbd> o <kbd>Esc</kbd> pausa (solo modos sin conexión). <kbd>M</kbd> silencia.</li>
+            <li>Gana quien llegue a <b>11</b> con <b>2 de ventaja</b>. El saque cambia cada 2 puntos y en el 10-10 cambia en cada punto.</li>
+            <li>Dónde golpea la pelota en la pala cambia el ángulo, y mover la pala al golpear le da efecto. Cada golpe la acelera.</li>
+          </ul>
+        </details>
+      </div>
+      <footer class="credits">Conexión directa entre navegadores (WebRTC · PeerJS). Sin registro.</footer>
+    </section>
+
+    <!-- SALA DE ESPERA -->
+    <section id="lobby" class="screen" aria-live="polite">
+      <div class="card center">
+        <h2 id="lobby-title">Creando sala…</h2>
+        <div id="lobby-code" class="code" aria-label="Código de sala">·····</div>
+        <p id="lobby-hint">Pásale este código a tu amigo o compártele el enlace.</p>
+        <div class="row center">
+          <button id="btn-copy-code" class="btn small">Copiar código</button>
+          <button id="btn-copy-link" class="btn small primary">Compartir enlace</button>
+        </div>
+        <p class="waiting"><span class="dot"></span> Esperando rival…</p>
+        <p id="lobby-error" class="error" role="alert"></p>
+        <button id="btn-lobby-cancel" class="btn ghost">Cancelar</button>
+      </div>
+    </section>
+
+    <!-- PARTIDA -->
+    <section id="game" class="screen">
+      <header class="hud">
+        <div class="player left"><span class="swatch red"></span><span id="name-l">Jugador 1</span><b id="score-l">0</b></div>
+        <div class="hud-mid">
+          <span id="hud-info"></span>
+          <button id="btn-mute" class="icon" aria-label="Silenciar" title="Silenciar (M)">🔊</button>
+          <button id="btn-leave" class="icon" aria-label="Salir" title="Salir">✕</button>
+        </div>
+        <div class="player right"><b id="score-r">0</b><span id="name-r">Jugador 2</span><span class="swatch black"></span></div>
+      </header>
+      <div class="stage">
+        <canvas id="canvas" width="1000" height="600" aria-label="Mesa de ping pong"></canvas>
+      </div>
+      <p id="you-hint" class="you-hint"></p>
+      <p class="rotate-hint">📱↻ Gira el móvil para jugar en horizontal</p>
+    </section>
+
+    <!-- OVERLAY (fin de partida / desconexión / pausa) -->
+    <div id="overlay" class="overlay" hidden>
+      <div class="card center">
+        <h2 id="ov-title"></h2>
+        <p id="ov-text"></p>
+        <div class="row center">
+          <button id="ov-primary" class="btn primary"></button>
+          <button id="ov-secondary" class="btn ghost">Menú</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </main>
+
+  <script src="vendor/peerjs.min.js"></script>
+  <script type="module" src="js/game.js"></script>
+</body>
+</html>
