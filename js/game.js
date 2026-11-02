@@ -1,18 +1,18 @@
 import {
-  W, H, PADDLE_H, BALL_R, TICK, PADDLE_SPEED, PADDLE_MAX_FOLLOW, RIGHT_FACE, BALL_SPEED_MAX,
-  clamp, clampPaddle, makeBall, moveBall, crossPaddle, bounceOffPaddle, serveBall,
-  placeForServe, extrapolate, isGameOver, currentServer,
+  HL, HW, TICK, SIM_DT, TIME_SCALE, REACH, REACH_Z_MIN, REACH_Z_MAX, PADDLE_SPEED, PADDLE_FOLLOW,
+  clamp, other, dirOf, makeBall, stepBall, extrapolate, clampToZone,
+  humanIntent, applyShot, solveServe, serveAim, isGameWon, currentServer, gauss,
 } from './physics.js';
 import { hostRoom, joinRoom, normalizeCode, errorText } from './net.js';
 import { sfx } from './audio.js';
-import { Renderer } from './render.js';
+import { Renderer, toWorld, VIEW_W, VIEW_H } from './render.js';
 
 // ============================================================
 //  Utilidades de interfaz
 // ============================================================
 const $ = (id) => document.getElementById(id);
 const screens = ['menu', 'lobby', 'game'];
-function show(id) { screens.forEach((s) => $(s).classList.toggle('active', s === id)); }
+const show = (id) => screens.forEach((s) => $(s).classList.toggle('active', s === id));
 
 let toastTimer;
 function toast(msg) {
@@ -20,7 +20,7 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
 }
 
 function overlay({ title, text = '', primary, onPrimary, secondary = 'Menú', onSecondary = backToMenu }) {
@@ -38,222 +38,369 @@ function overlay({ title, text = '', primary, onPrimary, secondary = 'Menú', on
   (primary ? p : $('ov-secondary')).focus();
 }
 const hideOverlay = () => { $('overlay').hidden = true; };
-
 const playerName = () => ($('name').value.trim() || 'Jugador').slice(0, 14);
+const bestOfLabel = (n) => (n === 1 ? 'a 1 juego' : `al mejor de ${n} juegos`);
 
 // ============================================================
-//  Entrada: teclado, ratón y táctil
+//  Entrada
 // ============================================================
 const keys = new Set();
-const GAME_KEYS = ['ArrowUp', 'ArrowDown', 'KeyW', 'KeyS', 'Space'];
+const mouse = { left: false, right: false };
+let touchActive = false;
+const GAME_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'Enter'];
 
+const KEYMAPS = {
+  // Un jugador (online / CPU): WASD o flechas; espacio/clic = golpe fuerte y saque; C/clic derecho = cortado.
+  single: { up: ['KeyW', 'ArrowUp'], down: ['KeyS', 'ArrowDown'], left: ['KeyA', 'ArrowLeft'], right: ['KeyD', 'ArrowRight'], power: ['Space', 'ShiftLeft', 'ShiftRight'], chop: ['KeyC', 'ControlLeft'], mouse: true },
+  p1: { up: ['KeyW'], down: ['KeyS'], left: ['KeyA'], right: ['KeyD'], power: ['Space'], chop: ['KeyQ'], mouse: true },
+  p2: { up: ['ArrowUp'], down: ['ArrowDown'], left: ['ArrowLeft'], right: ['ArrowRight'], power: ['Enter', 'Numpad0'], chop: ['ShiftRight', 'Period'], mouse: false },
+};
+const anyKey = (list) => list.some((k) => keys.has(k));
+
+/** Pala controlada por una persona (teclado, ratón o dedo). Coordenadas en metros. */
 class PaddleControl {
-  constructor(up, down) {
-    this.up = up; this.down = down;
-    this.y = (H - PADDLE_H) / 2;
-    this.vel = 0;
-    this.pointer = null; // y lógica objetivo (centro de la pala) o null
+  constructor(side, map) {
+    this.side = side; this.map = map;
+    this.reset();
   }
-  reset() { this.y = (H - PADDLE_H) / 2; this.vel = 0; this.pointer = null; }
-  update(dt) {
-    let dir = 0;
-    if (this.up.some((k) => keys.has(k))) dir -= 1;
-    if (this.down.some((k) => keys.has(k))) dir += 1;
-    let ny = this.y;
-    if (dir) {
+  reset() {
+    this.x = -dirOf(this.side) * (HL + 0.45);
+    this.y = 0; this.px = this.x; this.py = 0; this.vx = 0; this.vy = 0;
+    this.pointer = null;
+  }
+  get powerHeld() { return anyKey(this.map.power) || (this.map.mouse && (mouse.left || touchActive)); }
+  get mods() { return { power: anyKey(this.map.power) || (this.map.mouse && mouse.left), chop: anyKey(this.map.chop) || (this.map.mouse && mouse.right) }; }
+  update(dt, serving) {
+    this.px = this.x; this.py = this.y;
+    const lat = (anyKey(this.map.down) ? 1 : 0) - (anyKey(this.map.up) ? 1 : 0);
+    const fwd = (anyKey(this.map.right) ? 1 : 0) - (anyKey(this.map.left) ? 1 : 0); // derecha en pantalla = +x
+    if (lat || fwd) {
       this.pointer = null;
-      ny += dir * PADDLE_SPEED * dt;
-    } else if (this.pointer != null) {
-      const target = this.pointer - PADDLE_H / 2;
-      const step = PADDLE_MAX_FOLLOW * dt;
-      ny += clamp(target - ny, -step, step);
+      const n = Math.hypot(lat, fwd);
+      this.x += (fwd / n) * PADDLE_SPEED * dt;
+      this.y += (lat / n) * PADDLE_SPEED * dt;
+    } else if (this.pointer) {
+      const dx = this.pointer.x - this.x, dy = this.pointer.y - this.y;
+      const dist = Math.hypot(dx, dy);
+      const step = PADDLE_FOLLOW * dt;
+      if (dist > step) { this.x += (dx / dist) * step; this.y += (dy / dist) * step; }
+      else { this.x = this.pointer.x; this.y = this.pointer.y; }
     }
-    ny = clampPaddle(ny);
-    this.vel = (ny - this.y) / dt;
-    this.y = ny;
+    clampToZone(this, this.side, serving);
+    this.vx = (this.x - this.px) / dt;
+    this.vy = (this.y - this.py) / dt;
   }
 }
 
-const ALL_UP = ['KeyW', 'ArrowUp'];
-const ALL_DOWN = ['KeyS', 'ArrowDown'];
-
 window.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT') return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   keys.add(e.code);
   if (mode && GAME_KEYS.includes(e.code)) e.preventDefault();
   if (e.code === 'KeyM') toggleMute();
   if ((e.code === 'KeyP' || e.code === 'Escape') && mode?.togglePause) mode.togglePause();
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
-window.addEventListener('blur', () => keys.clear());
+window.addEventListener('blur', () => { keys.clear(); mouse.left = mouse.right = false; touchActive = false; });
 
 const canvas = $('canvas');
 function toLogical(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
-  return { x: ((clientX - r.left) / r.width) * W, y: ((clientY - r.top) / r.height) * H };
+  return toWorld(((clientX - r.left) / r.width) * VIEW_W, ((clientY - r.top) / r.height) * VIEW_H);
 }
 canvas.addEventListener('pointermove', (e) => {
   if (e.pointerType === 'touch' || !mode) return;
-  const p = toLogical(e.clientX, e.clientY);
-  mode.pointer?.(p.x, p.y);
+  mode.pointer?.(toLogical(e.clientX, e.clientY));
 });
+canvas.addEventListener('mousedown', (e) => { if (e.button === 0) mouse.left = true; if (e.button === 2) mouse.right = true; sfx.unlock(); });
+window.addEventListener('mouseup', (e) => { if (e.button === 0) mouse.left = false; if (e.button === 2) mouse.right = false; });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 function onTouch(e) {
   if (!mode) return;
   e.preventDefault();
-  for (const t of e.touches) {
-    const p = toLogical(t.clientX, t.clientY);
-    mode.pointer?.(p.x, p.y, true);
-  }
+  touchActive = e.touches.length > 0;
+  for (const t of e.touches) mode.pointer?.(toLogical(t.clientX, t.clientY), true);
 }
 canvas.addEventListener('touchstart', onTouch, { passive: false });
 canvas.addEventListener('touchmove', onTouch, { passive: false });
+canvas.addEventListener('touchend', (e) => { touchActive = e.touches.length > 0; }, { passive: false });
+
+/** Gestiona la carga del saque (mantener pulsado, soltar para sacar). */
+class ServeCharger {
+  constructor() { this.charge = null; }
+  update(dtReal, held, canServe, onRelease) {
+    if (!canServe) { this.charge = null; return; }
+    if (held) {
+      if (this.charge == null) this.charge = 0;
+      this.charge = Math.min(1, this.charge + dtReal / 0.9);
+    } else if (this.charge != null) {
+      const p = this.charge;
+      this.charge = null;
+      onRelease(p);
+    }
+  }
+}
 
 // ============================================================
-//  Partida autoritativa (host online y modos locales)
+//  Partida autoritativa con el reglamento (host online y modos locales)
 // ============================================================
+const CALLS = {
+  serveOwn: 'Saque nulo: debe botar en tu campo',
+  serveFail: 'Saque nulo',
+  ownSide: 'Bote en su propio campo',
+  net: '¡Red!',
+  out: '¡Fuera!',
+  double: 'Doble bote',
+  noReturn: 'No la devuelve',
+  volley: 'Volea: hay que dejarla botar',
+  let: 'Let: se repite el saque',
+};
+
 class Match {
-  constructor(hooks, { remoteRight = false } = {}) {
+  constructor(hooks, { remoteRight = false, bestOf = 1 } = {}) {
     this.hooks = hooks;
-    this.remoteRight = remoteRight; // en online el invitado decide los golpes de su pala
-    this.firstServer = Math.random() < 0.5 ? 'L' : 'R';
-    this.ly = this.ry = (H - PADDLE_H) / 2;
-    this.lvel = this.rvel = 0;
+    this.remoteRight = remoteRight;
+    this.bestOf = bestOf;
+    this.matchFirst = Math.random() < 0.5 ? 'L' : 'R';
+    this.pads = { L: padState('L'), R: padState('R') };
+    this.localSides = remoteRight ? ['L'] : ['L', 'R'];
+    this.intentFor = null; // (side, ball, pad) => intent
     this.rtt = 0.1;
-    this.reset();
+    this.newMatch();
   }
 
-  reset() {
-    this.ball = makeBall();
-    this.score = { L: 0, R: 0 };
-    this.hits = 0;
-    this.phase = 'countdown';
-    this.timer = 3;
+  newMatch() {
+    this.games = { L: 0, R: 0 };
+    this.gameNo = 0;
     this.winner = null;
-    this.pending = null;
-    this.time = 0;
+    this.startGame();
+  }
+
+  startGame() {
+    this.score = { L: 0, R: 0 };
+    // Quien sacó primero en un juego recibe primero en el siguiente (ITTF 2.13.2).
+    this.gameFirst = this.gameNo % 2 === 0 ? this.matchFirst : other(this.matchFirst);
+    this.ball = makeBall();
+    this.hits = 0;
+    this.toServe();
+  }
+
+  toServe() {
+    this.phase = 'serve';
+    this.timer = 0;
+    this.rally = { hitter: null, serve: false, bounces: [], netTouch: false, netHit: false };
+    this.pendingEnd = null;
+    this.call = '';
     this.lastScorer = null;
   }
 
-  rematch() {
-    this.firstServer = this.firstServer === 'L' ? 'R' : 'L';
-    this.reset();
+  get server() { return currentServer(this.score.L, this.score.R, this.gameFirst); }
+
+  requestServe(side, power) {
+    if (this.phase !== 'serve' || side !== this.server) return;
+    this.phase = 'toss';
+    this.tossPower = clamp(+power || 0.5, 0, 1);
+    this.ball.vz = 1.9; // lanzamiento vertical de más de 16 cm (ITTF 2.6.2)
+    this.hooks.toss?.();
   }
 
-  get server() { return currentServer(this.score.L, this.score.R, this.firstServer); }
-
   tick(dt) {
-    this.time += dt;
+    this.timer += dt;
     const b = this.ball;
+    const srv = this.server;
+    const sp = this.pads[srv];
 
-    if (this.phase === 'countdown') {
-      const prev = Math.ceil(this.timer);
-      this.timer -= dt;
-      const sec = Math.ceil(this.timer);
-      if (sec !== prev && sec > 0) this.hooks.tick?.(sec);
-      const srv = this.server;
-      placeForServe(b, srv, srv === 'L' ? this.ly : this.ry);
-      if (this.timer <= 0) {
-        serveBall(b, srv, srv === 'L' ? this.ly : this.ry);
-        this.phase = 'playing';
-        this.hooks.go?.();
-      }
+    if (this.phase === 'serve') {
+      Object.assign(b, { x: sp.x + dirOf(srv) * 0.13, y: sp.y + 0.06, z: 0.12, vx: 0, vy: 0, vz: 0, top: 0, side: 0 });
+      if (this.timer > 9) this.requestServe(srv, 0.4); // evita que la partida se quede parada
       return;
     }
 
-    if (this.phase === 'point') {
-      this.timer -= dt;
-      if (this.timer <= 0) {
-        if (isGameOver(this.score.L, this.score.R)) {
-          this.phase = 'over';
-          this.winner = this.score.L > this.score.R ? 'L' : 'R';
-          this.hooks.over?.(this.winner);
-        } else {
-          this.phase = 'countdown';
-          this.timer = 1.2;
-        }
+    if (this.phase === 'toss') {
+      b.vz -= 9.81 * dt; b.z += b.vz * dt;
+      if (b.vz < 0 && b.z <= 0.16) this.strikeServe();
+      return;
+    }
+
+    if (this.phase === 'point' || this.phase === 'gamebreak') {
+      if (this.phase === 'point') {
+        const ev = [];
+        stepBall(b, dt, ev); // la pelota sigue cayendo de forma natural
       }
+      if (this.timer >= (this.phase === 'point' ? 0.85 : 1.6)) this.afterPoint();
       return;
     }
 
     if (this.phase !== 'playing') return;
 
-    const px = b.x, py = b.y;
-    if (moveBall(b, dt)) this.hooks.wall?.();
+    const prev = { x: b.x, y: b.y, z: b.z };
+    const ev = [];
+    stepBall(b, dt, ev);
+    for (const e of ev) { this.rule(e); if (this.phase !== 'playing') return; }
 
-    const cl = crossPaddle(px, py, b, 'L', this.ly);
-    if (cl?.hit) {
-      bounceOffPaddle(b, 'L', this.ly, cl.y, this.lvel);
-      this.hits++;
-      this.hooks.paddle?.('L', b);
+    if (this.pendingEnd && this.timer - this.pendingEnd.at > Math.min(0.25, 0.06 + this.rtt * 0.6)) {
+      const p = this.pendingEnd;
+      this.pendingEnd = null;
+      return this.pointTo(p.winner, p.call);
     }
+    for (const s of this.localSides) this.tryHit(s, prev);
+  }
 
-    const cr = crossPaddle(px, py, b, 'R', this.ry);
-    if (cr) {
-      if (this.remoteRight) {
-        // Esperamos el veredicto del invitado, pero guardamos el nuestro por si no llega.
-        this.pending = { at: this.time, hostHit: cr.hit, y: cr.y, ry: this.ry, h: this.hits };
-      } else if (cr.hit) {
-        bounceOffPaddle(b, 'R', this.ry, cr.y, this.rvel);
-        this.hits++;
-        this.hooks.paddle?.('R', b);
-      }
+  strikeServe() {
+    const srv = this.server, b = this.ball, pad = this.pads[srv];
+    let sol = solveServe(b, srv, this.tossPower, serveAim(pad.y));
+    if (!sol) sol = solveServe(b, srv, 0.4, 0);
+    if (sol) { b.vx = sol.vx; b.vy = sol.vy; b.vz = sol.vz; }
+    b.top = -0.15; b.side = clamp(pad.vy / 6, -0.3, 0.3);
+    this.phase = 'playing';
+    this.timer = 0;
+    this.registerHit(srv, { serve: true });
+    this.rally.serve = true;
+  }
+
+  registerHit(side, it = {}) {
+    this.rally = { hitter: side, serve: false, bounces: [], netTouch: false, netHit: false };
+    this.hits++;
+    this.pendingEnd = null;
+    this.hooks.paddle?.(side, this.ball, it);
+  }
+
+  /** Aplica las reglas a cada evento físico. */
+  rule(e) {
+    if (this.pendingEnd) return;
+    const r = this.rally;
+    const A = r.hitter, B = other(A);
+    if (e.type === 'net') {
+      if (e.cord && r.serve) r.netTouch = true;
+      if (!e.cord) r.netHit = true;
+      this.hooks.net?.(e.cord);
+      return;
     }
-
-    if (b.x < -BALL_R * 3) return this.pointTo('R');
-    if (b.x > W + BALL_R * 3) {
-      if (this.remoteRight && this.pending && this.pending.h === this.hits) {
-        const wait = Math.min(0.45, 0.12 + this.rtt);
-        if (this.time - this.pending.at < wait) { b.x = W + BALL_R * 3; return; } // en espera
-        if (this.pending.hostHit) { // sin respuesta: usamos nuestra propia detección
-          bounceOffPaddle(b, 'R', this.pending.ry, this.pending.y, 0);
-          this.pending = null;
-          this.hits++;
-          this.hooks.paddle?.('R', b);
-          return;
+    if (e.type === 'table') {
+      this.hooks.bounce?.(e.side, this.ball);
+      r.bounces.push(e.side);
+      const n = r.bounces.length;
+      if (r.serve) {
+        if (n === 1 && e.side !== A) return this.end(B, CALLS.serveOwn);
+        if (n === 2) {
+          if (e.side !== B) return this.end(B, r.netHit ? CALLS.net : CALLS.serveFail);
+          if (r.netTouch) return this.letServe();
+          r.serve = false;
+          r.bounces = [B];
         }
+        return;
       }
-      return this.pointTo('L');
+      if (n === 1 && e.side !== B) return this.end(B, r.netHit ? CALLS.net : CALLS.ownSide);
+      if (n >= 2) return this.end(A, CALLS.double);
+      return;
+    }
+    if (e.type === 'floor') {
+      if (!r.serve && r.bounces[0] === B) return this.end(A, CALLS.noReturn);
+      return this.end(B, r.netHit ? CALLS.net : CALLS.out);
     }
   }
 
-  pointTo(side) {
+  end(winner, call) {
+    // En online, si el punto es para el anfitrión porque el invitado "no llegó",
+    // esperamos un instante por si su golpe viene de camino por la red.
+    if (this.remoteRight && winner === 'L' && this.rally.hitter === 'L' && !this.rally.serve && this.rally.bounces[0] === 'R') {
+      this.pendingEnd = { winner, call, at: this.timer };
+      return;
+    }
+    this.pointTo(winner, call);
+  }
+
+  tryHit(P, prev) {
+    const r = this.rally, b = this.ball, pad = this.pads[P];
+    if (r.hitter === P) return;
+    const d = dirOf(P);
+    if (b.vx * d >= 0) return; // no viene hacia él
+    const prevRel = (prev.x - pad.px) * d, rel = (b.x - pad.x) * d;
+    if (!(prevRel > 0 && rel <= 0)) return;
+    if (Math.abs(b.y - pad.y) > REACH || b.z < REACH_Z_MIN || b.z > REACH_Z_MAX) return;
+    const bounced = !r.serve && r.bounces[0] === P;
+    if (!bounced) {
+      if (Math.abs(b.x) > HL) return; // ya ha pasado la mesa sin botar: la deja ir (será fuera)
+      return this.pointTo(other(P), CALLS.volley);
+    }
+    const it = this.intentFor(P, b, pad);
+    applyShot(b, it, P);
+    this.registerHit(P, it);
+  }
+
+  /** Golpe del invitado (online). */
+  applyRemoteHit(m) {
+    if (this.phase !== 'playing' || m.h !== this.hits + 1 || this.rally.hitter === 'R') return;
+    const [x, y, z, vx, vy, vz, top, side] = m.b;
+    if (![x, y, z, vx, vy, vz].every(Number.isFinite) || vx >= 0 || Math.hypot(vx, vy, vz) > 40) return;
+    Object.assign(this.ball, extrapolate({ x, y, z, vx, vy, vz, top: clamp(top, -1, 1), side: clamp(side, -1, 1) }, clamp(this.rtt / 2, 0, 0.2)));
+    this.registerHit('R', { smash: m.sm, chop: m.ch });
+  }
+  applyRemoteVolley(m) {
+    if (this.phase === 'playing' && m.h === this.hits + 1 && this.rally.hitter === 'L') this.pointTo('L', CALLS.volley);
+  }
+
+  pointTo(side, call) {
     this.score[side]++;
     this.lastScorer = side;
+    this.call = call;
     this.phase = 'point';
-    this.timer = 1.1;
-    this.pending = null;
-    this.hooks.score?.(side);
+    this.timer = 0;
+    this.pendingEnd = null;
+    this.hooks.score?.(side, call);
   }
 
-  /** El invitado informa de que su pala golpeó la pelota. */
-  applyRemoteHit(m) {
-    const b = this.ball;
-    if (this.phase !== 'playing' || m.h !== this.hits + 1) return;
-    if (b.vx <= 0 && b.x < W / 2) return; // incoherente: la pelota no iba hacia él
-    const nb = { x: m.b[0], y: m.b[1], vx: m.b[2], vy: m.b[3] };
-    const sp = Math.hypot(nb.vx, nb.vy);
-    if (!(sp > 0) || sp > BALL_SPEED_MAX * 1.2 || nb.vx >= 0) return; // validación básica
-    Object.assign(b, extrapolate(nb, clamp(this.rtt / 2, 0, 0.25)));
-    this.hits++;
-    this.pending = null;
-    this.hooks.paddle?.('R', b);
+  letServe() {
+    this.lastScorer = null;
+    this.call = CALLS.let;
+    this.phase = 'point';
+    this.timer = 0;
+    this.hooks.let?.();
   }
 
-  /** El invitado informa de que falló. */
-  applyRemoteMiss(m) {
-    if (this.phase !== 'playing' || m.h !== this.hits + 1) return;
-    if (this.ball.vx > 0 && this.ball.x > W * 0.55) this.pointTo('L');
+  afterPoint() {
+    const { L, R } = this.score;
+    if (this.phase === 'point' && isGameWon(L, R)) {
+      const w = L > R ? 'L' : 'R';
+      this.games[w]++;
+      const need = Math.ceil(this.bestOf / 2);
+      if (this.games[w] >= need) {
+        this.phase = 'over';
+        this.winner = w;
+        this.hooks.over?.(w);
+        return;
+      }
+      this.phase = 'gamebreak';
+      this.timer = 0;
+      this.call = 'game';
+      this.lastScorer = w;
+      this.hooks.game?.(w);
+      return;
+    }
+    if (this.phase === 'gamebreak') { this.gameNo++; this.startGame(); return; }
+    this.toServe();
+  }
+
+  rematch() {
+    this.matchFirst = other(this.matchFirst);
+    this.newMatch();
   }
 
   snapshot(seq) {
     const b = this.ball;
-    const r = (v) => Math.round(v * 10) / 10;
+    const r3 = (v) => Math.round(v * 1000) / 1000;
     return {
-      t: 's', q: seq, ph: this.phase, tm: r(this.timer),
-      b: [r(b.x), r(b.y), r(b.vx), r(b.vy)], l: r(this.ly),
-      sc: [this.score.L, this.score.R], h: this.hits, sv: this.server, w: this.winner,
+      t: 's', q: seq, ph: this.phase, tm: r3(this.timer),
+      b: [b.x, b.y, b.z, b.vx, b.vy, b.vz, b.top, b.side].map(r3),
+      l: [r3(this.pads.L.x), r3(this.pads.L.y)],
+      sc: [this.score.L, this.score.R], g: [this.games.L, this.games.R], bo: this.bestOf,
+      h: this.hits, lh: this.rally.hitter, sv: this.server, w: this.winner, c: this.call, ls: this.lastScorer,
     };
   }
+}
+
+function padState(side) {
+  const x = -dirOf(side) * (HL + 0.45);
+  return { x, y: 0, px: x, py: 0, vx: 0, vy: 0 };
 }
 
 // ============================================================
@@ -264,146 +411,204 @@ class GuestView {
     this.hooks = hooks;
     this.send = send;
     this.ball = makeBall();
-    this.ly = this.lyTarget = (H - PADDLE_H) / 2;
+    this.hostPad = padState('L');
+    this.hostTarget = { x: this.hostPad.x, y: 0 };
     this.score = { L: 0, R: 0 };
+    this.games = { L: 0, R: 0 };
+    this.bestOf = 1;
     this.phase = 'waiting';
     this.timer = 0;
     this.server = 'L';
     this.winner = null;
-    this.hits = 0;       // golpes confirmados por el host
-    this.expected = 0;   // golpes incluyendo los predichos localmente
-    this.sounded = 0;
-    this.missFor = -1;
+    this.call = '';
+    this.lastScorer = null;
+    this.hits = 0;
+    this.expected = 0;
+    this.hostHitter = null;
+    this.bouncedR = false;
     this.lastSeq = -1;
-    this.offset = { x: 0, y: 0 }; // suavizado visual de correcciones
+    this.offset = { x: 0, y: 0, z: 0 };
     this.rtt = 0.1;
-    this.sec = 0;
   }
+
+  get hitter() { return this.expected > this.hits ? 'R' : this.hostHitter; }
 
   onSnapshot(s) {
     if (s.q <= this.lastSeq) return; // canal no ordenado: descartar antiguos
     this.lastSeq = s.q;
-    const prevPhase = this.phase;
-    const prevScore = this.score;
-    this.lyTarget = s.l;
+    const prevPhase = this.phase, prevScore = this.score, prevGames = this.games;
+    this.hostTarget = { x: s.l[0], y: s.l[1] };
     this.score = { L: s.sc[0], R: s.sc[1] };
-    this.phase = s.ph;
-    this.timer = s.tm;
-    this.server = s.sv;
-    this.winner = s.w;
+    this.games = { L: s.g[0], R: s.g[1] };
+    this.bestOf = s.bo;
+    this.phase = s.ph; this.timer = s.tm; this.server = s.sv; this.winner = s.w;
+    this.call = s.c; this.lastScorer = s.ls;
 
-    if (this.score.L > prevScore.L) { this.lastScorer = 'L'; this.hooks.score?.('L'); }
-    else if (this.score.R > prevScore.R) { this.lastScorer = 'R'; this.hooks.score?.('R'); }
-    if (this.phase === 'countdown') {
-      const sec = Math.ceil(this.timer);
-      if (sec !== this.sec && sec > 0) this.hooks.tick?.(sec);
-      this.sec = sec;
-    } else this.sec = 0;
-    if (prevPhase === 'countdown' && this.phase === 'playing') this.hooks.go?.();
+    if (this.score.L > prevScore.L) this.hooks.score?.('L', s.c);
+    else if (this.score.R > prevScore.R) this.hooks.score?.('R', s.c);
+    if (this.phase === 'point' && prevPhase !== 'point' && !s.ls) this.hooks.let?.();
+    if (this.phase === 'gamebreak' && prevPhase !== 'gamebreak' && (this.games.L !== prevGames.L || this.games.R !== prevGames.R)) this.hooks.game?.(s.ls);
+    if (this.phase === 'toss' && prevPhase === 'serve') this.hooks.toss?.();
     if (this.phase === 'over' && prevPhase !== 'over') this.hooks.over?.(this.winner);
     if (prevPhase === 'over' && this.phase !== 'over') this.hooks.restart?.();
 
-    const sb = { x: s.b[0], y: s.b[1], vx: s.b[2], vy: s.b[3] };
+    const sb = { x: s.b[0], y: s.b[1], z: s.b[2], vx: s.b[3], vy: s.b[4], vz: s.b[5], top: s.b[6], side: s.b[7] };
     if (this.phase !== 'playing') {
-      this.ball = sb;
-      this.hits = this.expected = this.sounded = s.h;
-      this.missFor = -1;
-      this.offset.x = this.offset.y = 0;
+      if (this.phase !== 'point' || prevPhase !== 'playing') this.ball = sb;
+      this.hits = this.expected = s.h;
+      this.hostHitter = s.lh;
+      this.bouncedR = false;
+      this.offset.x = this.offset.y = this.offset.z = 0;
       return;
     }
     if (s.h < this.expected) return; // el host aún no ha procesado nuestro golpe
-
-    if (s.h > this.sounded) { this.sounded = s.h; this.hooks.paddle?.(sb.vx > 0 ? 'L' : 'R', sb); }
+    if (s.h > this.expected) {
+      // Nuevo golpe del anfitrión (o saque): empieza una jugada nueva para nosotros.
+      this.bouncedR = false;
+      this.volleySent = false;
+      if (s.lh === 'L') this.hooks.paddle?.('L', sb, {});
+    }
     this.hits = this.expected = s.h;
+    this.hostHitter = s.lh;
 
-    const t = extrapolate(sb, clamp(this.rtt / 2, 0, 0.25));
+    const t = extrapolate(sb, clamp(this.rtt / 2, 0, 0.2));
     const b = this.ball;
-    const dx = t.x - b.x, dy = t.y - b.y;
-    if (Math.sign(t.vx) !== Math.sign(b.vx) || dx * dx + dy * dy > 70 * 70) {
-      this.offset.x += b.x - t.x;
-      this.offset.y += b.y - t.y;
+    const dx = t.x - b.x, dy = t.y - b.y, dz = t.z - b.z;
+    if (Math.sign(t.vx) !== Math.sign(b.vx) || dx * dx + dy * dy + dz * dz > 0.12 * 0.12) {
+      this.offset.x += b.x - t.x; this.offset.y += b.y - t.y; this.offset.z += b.z - t.z;
       Object.assign(b, t);
     } else {
-      b.x += dx * 0.2; b.y += dy * 0.2;
-      b.vx = t.vx; b.vy = t.vy;
+      b.x += dx * 0.25; b.y += dy * 0.25; b.z += dz * 0.25;
+      b.vx = t.vx; b.vy = t.vy; b.vz = t.vz; b.top = t.top; b.side = t.side;
     }
   }
 
-  tick(dt, ry, rvel) {
-    this.ly += (this.lyTarget - this.ly) * Math.min(1, dt * 25);
-    const k = Math.exp(-dt * 10);
-    this.offset.x *= k; this.offset.y *= k;
-
-    if (this.phase === 'countdown' && this.server === 'R') placeForServe(this.ball, 'R', ry);
-    if (this.phase !== 'playing') return;
+  tick(dt, pad, mods) {
+    const k = Math.min(1, dt * 40);
+    this.hostPad.px = this.hostPad.x; this.hostPad.py = this.hostPad.y;
+    this.hostPad.x += (this.hostTarget.x - this.hostPad.x) * k;
+    this.hostPad.y += (this.hostTarget.y - this.hostPad.y) * k;
+    const dk = Math.exp(-dt * 18);
+    this.offset.x *= dk; this.offset.y *= dk; this.offset.z *= dk;
 
     const b = this.ball;
-    const px = b.x, py = b.y;
-    if (moveBall(b, dt)) this.hooks.wall?.();
+    if (this.phase === 'serve' && this.server === 'R') {
+      Object.assign(b, { x: pad.x - 0.13, y: pad.y + 0.06, z: 0.12, vx: 0, vy: 0, vz: 0 });
+      return;
+    }
+    if (this.phase === 'point') { stepBall(b, dt); return; }
+    if (this.phase !== 'playing') return;
 
-    // Predicción del golpe del rival (el host confirmará o corregirá).
-    const cl = crossPaddle(px, py, b, 'L', this.ly);
-    if (cl?.hit) {
-      bounceOffPaddle(b, 'L', this.ly, cl.y, 0);
-      this.expected++;
-      this.sounded = this.expected;
-      this.hooks.paddle?.('L', b);
+    const prev = { x: b.x, y: b.y, z: b.z };
+    const ev = [];
+    stepBall(b, dt, ev);
+    for (const e of ev) {
+      if (e.type === 'table') { this.hooks.bounce?.(e.side, b); if (e.side === 'R' && this.hitter === 'L') this.bouncedR = true; }
+      if (e.type === 'net') this.hooks.net?.(e.cord);
     }
 
-    // Nuestra pala: aquí decidimos nosotros y se lo comunicamos al host.
-    const cr = crossPaddle(px, py, b, 'R', ry);
-    if (cr) {
-      if (cr.hit) {
-        bounceOffPaddle(b, 'R', ry, cr.y, rvel);
-        this.expected++;
-        this.sounded = this.expected;
-        this.send({ t: 'hit', h: this.expected, b: [b.x, b.y, b.vx, b.vy] });
-        this.hooks.paddle?.('R', b);
-      } else if (this.missFor !== this.expected) {
-        this.missFor = this.expected;
-        this.send({ t: 'miss', h: this.expected + 1 });
-      }
+    // Nuestra pala: decidimos nosotros y lo comunicamos al anfitrión.
+    if (this.hitter === 'R' || b.vx <= 0) return;
+    const prevRel = -(prev.x - pad.px), rel = -(b.x - pad.x);
+    if (!(prevRel > 0 && rel <= 0)) return;
+    if (Math.abs(b.y - pad.y) > REACH || b.z < REACH_Z_MIN || b.z > REACH_Z_MAX) return;
+    if (!this.bouncedR) {
+      if (Math.abs(b.x) > HL || this.volleySent) return;
+      this.volleySent = true;
+      this.send({ t: 'volley', h: this.expected + 1 });
+      return;
     }
-    b.x = clamp(b.x, -BALL_R * 4, W + BALL_R * 4);
+    const it = humanIntent(b, pad, 'R', mods);
+    applyShot(b, it, 'R');
+    this.expected++;
+    this.send({ t: 'hit', h: this.expected, b: [b.x, b.y, b.z, b.vx, b.vy, b.vz, b.top, b.side], sm: it.smash ? 1 : 0, ch: it.chop ? 1 : 0 });
+    this.hooks.paddle?.('R', b, it);
   }
 
-  get renderBall() { return { x: this.ball.x + this.offset.x, y: this.ball.y + this.offset.y }; }
+  get renderBall() { const b = this.ball; return { x: b.x + this.offset.x, y: b.y + this.offset.y, z: b.z + this.offset.z }; }
 }
 
 // ============================================================
-//  CPU
+//  CPU: predice la trayectoria (con botes y efecto) y elige golpe
 // ============================================================
 const CPU_LEVELS = {
-  easy: { speed: 360, error: 70, reaction: 0.28 },
-  normal: { speed: 560, error: 38, reaction: 0.16 },
-  hard: { speed: 820, error: 14, reaction: 0.07 },
+  easy: { speed: 2.6, err: 0.11, react: 0.22, power: [0.1, 0.45], noise: 0.07, smash: 0.25, aim: 0.45 },
+  normal: { speed: 3.8, err: 0.06, react: 0.13, power: [0.25, 0.7], noise: 0.045, smash: 0.6, aim: 0.58 },
+  hard: { speed: 5.2, err: 0.025, react: 0.06, power: [0.45, 0.95], noise: 0.028, smash: 0.95, aim: 0.66 },
 };
+
 class CpuBrain {
-  constructor(level) { this.cfg = CPU_LEVELS[level] || CPU_LEVELS.normal; this.err = 0; this.lastHits = -1; this.wait = 0; this.target = H / 2; }
-  update(dt, match, ctrl) {
-    const b = match.ball;
-    if (match.hits !== this.lastHits) {
-      this.lastHits = match.hits;
-      this.err = (Math.random() * 2 - 1) * this.cfg.error;
-      this.wait = this.cfg.reaction;
-    }
-    this.wait -= dt;
-    if (this.wait <= 0) {
-      if (match.phase === 'playing' && b.vx > 0) {
-        // Predice dónde cruzará la pelota su línea, contando rebotes en bandas.
-        const t = (RIGHT_FACE - b.x) / b.vx;
-        this.target = extrapolate(b, Math.max(0, t)).y + this.err;
-      } else if (match.phase === 'countdown' && match.server === 'R') {
-        this.target = H / 2 + Math.sin(match.time * 2) * 60;
-      } else {
-        this.target = H / 2 + (b.y - H / 2) * 0.3;
+  constructor(level, side = 'R') {
+    this.cfg = CPU_LEVELS[level] || CPU_LEVELS.normal;
+    this.side = side;
+    this.plan = null; this.lastHits = -1; this.wait = 0; this.serveDelay = 1.2; this.serveY = 0;
+  }
+  predict(ball, alreadyBounced = false) {
+    const d = dirOf(this.side);
+    const c = { ...ball };
+    let bounced = alreadyBounced;
+    for (let i = 0; i < 600; i++) {
+      const ev = [];
+      stepBall(c, SIM_DT, ev);
+      for (const e of ev) {
+        if (e.type === 'table' && e.side === this.side) bounced = true;
+        if (e.type === 'floor') return null;
+      }
+      if (bounced) {
+        const behind = -d * c.x > HL + 0.08;
+        const late = c.vz < 0 && c.z < 0.1 && -d * c.x > HL - 0.35;
+        if (behind || late) return { x: c.x, y: c.y };
       }
     }
-    const goal = clampPaddle(this.target - PADDLE_H / 2);
+    return null;
+  }
+  update(dt, m, pad) {
+    const d = dirOf(this.side);
+    pad.px = pad.x; pad.py = pad.y;
+    let goal;
+    if (m.phase === 'serve' && m.server === this.side) {
+      goal = { x: -d * (HL + 0.25), y: this.serveY };
+      this.serveDelay -= dt;
+      if (this.serveDelay <= 0) {
+        const [a, b] = this.cfg.power;
+        m.requestServe(this.side, a * 0.6 + Math.random() * (b - a * 0.6));
+      }
+    } else {
+      this.serveDelay = 0.9 + Math.random() * 0.8;
+      this.serveY = (Math.random() * 2 - 1) * 0.45;
+      const incoming = m.phase === 'playing' && m.rally.hitter === other(this.side) && m.ball.vx * d < 0;
+      if (incoming) {
+        if (m.hits !== this.lastHits) { this.lastHits = m.hits; this.wait = this.cfg.react; this.plan = null; this.err = gauss() * this.cfg.err; }
+        this.wait -= dt;
+        const bounced = !m.rally.serve && m.rally.bounces?.[0] === this.side;
+        if (this.wait <= 0 && (!this.plan || Math.random() < 0.04)) this.plan = this.predict(m.ball, bounced) || { x: -d * (HL + 0.6), y: m.ball.y > 0 ? -0.4 : 0.4, dodge: true };
+        goal = this.plan ? { x: this.plan.x - d * 0.02, y: this.plan.y + (this.plan.dodge ? 0 : this.err) } : { x: pad.x, y: pad.y };
+      } else {
+        goal = { x: -d * (HL + 0.5), y: m.ball.y * 0.3 };
+      }
+    }
+    const dx = goal.x - pad.x, dy = goal.y - pad.y, dist = Math.hypot(dx, dy);
     const step = this.cfg.speed * dt;
-    const ny = clampPaddle(ctrl.y + clamp(goal - ctrl.y, -step, step));
-    ctrl.vel = (ny - ctrl.y) / dt;
-    ctrl.y = ny;
+    if (dist > step) { pad.x += (dx / dist) * step; pad.y += (dy / dist) * step; } else { pad.x = goal.x; pad.y = goal.y; }
+    clampToZone(pad, this.side, m.phase === 'serve');
+    pad.vx = (pad.x - pad.px) / dt; pad.vy = (pad.y - pad.py) / dt;
+  }
+  intent(b, pad, opp) {
+    const c = this.cfg;
+    const [pa, pb] = c.power;
+    const smash = b.z > 0.3 && Math.random() < c.smash;
+    const chop = !smash && b.z < 0.08 && Math.random() < 0.35;
+    let power = smash ? 1 : pa + Math.random() * (pb - pa);
+    if (chop) power = Math.min(power, 0.35);
+    // Apunta lejos del rival
+    const away = opp.y > 0 ? -1 : 1;
+    const aimY = clamp(away * (0.15 + Math.random() * c.aim) + gauss() * 0.1, -0.7, 0.7);
+    const top = chop ? -0.7 : smash ? 0.15 : 0.25 + power * 0.6;
+    return {
+      speed: chop ? 3.8 + power * 3 : 5.2 + power * 8 + (smash ? 4 : 0), top,
+      side: gauss() * 0.15, aimY, depth: chop ? 0.6 + power * 0.4 : 0.8 + power * 0.33,
+      noise: c.noise + power * 0.04, smash, chop,
+    };
   }
 }
 
@@ -413,65 +618,84 @@ class CpuBrain {
 let renderer;
 function fxHooks(extra = {}) {
   return {
-    paddle: (side, b) => {
-      const sp = Math.hypot(b.vx, b.vy) / BALL_SPEED_MAX;
+    paddle: (side, b, it = {}) => {
+      const sp = Math.min(1, Math.hypot(b.vx, b.vy) / 18);
       sfx.paddle(sp);
-      renderer.burst(b.x, b.y, side === 'L' ? '#ff6b6b' : '#e9ecef', 10 + Math.round(sp * 10));
-      if (sp > 0.75) renderer.kick(4);
+      renderer.burst(b.x, b.y, b.z, side === 'L' ? '#ff6b6b' : '#e9ecef', it.smash ? 22 : 9);
+      if (it.smash) renderer.kick(6);
     },
-    wall: () => sfx.wall(),
-    tick: () => sfx.tick(),
-    go: () => sfx.go(),
+    bounce: (side, b) => { sfx.bounce(); renderer.mark(b.x, b.y); },
+    net: (cord) => sfx.net(cord),
+    toss: () => sfx.toss(),
+    let: () => sfx.let(),
     ...extra,
   };
 }
 
-function bannerFor(state, names) {
-  if (state.phase === 'countdown') {
-    return { banner: String(Math.ceil(state.timer)), sub: `Saca ${names[state.server]}` };
+function viewText(st, names) {
+  const sc = `${st.score.L} – ${st.score.R}`;
+  switch (st.phase) {
+    case 'point':
+      if (!st.lastScorer) return { banner: 'Let', sub: 'El saque tocó la red: se repite' };
+      return { banner: st.call, sub: `Punto para ${names[st.lastScorer]} · ${sc}` };
+    case 'gamebreak':
+      return { banner: `Juego para ${names[st.lastScorer]}`, sub: `Juegos ${st.games.L} – ${st.games.R} · siguiente juego` };
+    case 'waiting': return { banner: 'Conectando…' };
+    default: return {};
   }
-  if (state.phase === 'point' && state.lastScorer) return { banner: `Punto para ${names[state.lastScorer]}`, sub: '' };
-  if (state.phase === 'waiting') return { banner: 'Conectando…', sub: '' };
-  return {};
 }
 
-function setHud(names, score, info) {
+function setHud(names, st, info) {
   $('name-l').textContent = names.L;
   $('name-r').textContent = names.R;
-  $('score-l').textContent = score.L;
-  $('score-r').textContent = score.R;
+  $('score-l').textContent = st.score.L;
+  $('score-r').textContent = st.score.R;
+  const showGames = st.bestOf > 1;
+  $('games-l').textContent = showGames ? `Juegos ${st.games.L}` : '';
+  $('games-r').textContent = showGames ? `Juegos ${st.games.R}` : '';
   if (info !== undefined) $('hud-info').textContent = info;
 }
+
+function serveHint(st, side, isTouch) {
+  if (st.phase !== 'serve') return '';
+  if (st.server === side) return isTouch ? 'Tu saque: mantén el dedo para cargar y suelta' : 'Tu saque: mantén ESPACIO o el clic para cargar la fuerza y suelta';
+  return '';
+}
+const isTouchDevice = () => matchMedia('(pointer: coarse)').matches;
 
 // ============================================================
 //  Modos de juego
 // ============================================================
 let mode = null;
 
-/** Modo local: contra CPU o 2 jugadores en el mismo dispositivo. */
 class LocalMode {
-  constructor(kind, level) {
+  constructor(kind, level, bestOf) {
     this.kind = kind;
     this.paused = false;
-    this.left = new PaddleControl(kind === 'cpu' ? ALL_UP : ['KeyW'], kind === 'cpu' ? ALL_DOWN : ['KeyS']);
-    this.right = new PaddleControl(['ArrowUp'], ['ArrowDown']);
-    this.cpu = kind === 'cpu' ? new CpuBrain(level) : null;
-    const me = playerName();
+    this.left = new PaddleControl('L', kind === 'cpu' ? KEYMAPS.single : KEYMAPS.p1);
+    this.right = new PaddleControl('R', KEYMAPS.p2);
+    this.cpu = kind === 'cpu' ? new CpuBrain(level, 'R') : null;
+    this.chargeL = new ServeCharger();
+    this.chargeR = new ServeCharger();
     this.names = kind === 'cpu'
-      ? { L: me, R: `CPU (${{ easy: 'fácil', normal: 'normal', hard: 'difícil' }[level]})` }
+      ? { L: playerName(), R: `CPU (${{ easy: 'fácil', normal: 'normal', hard: 'difícil' }[level]})` }
       : { L: 'Jugador 1', R: 'Jugador 2' };
     this.match = new Match(fxHooks({
-      score: (side) => { sfx.score(kind !== 'cpu' || side === 'L'); renderer.kick(8); },
+      score: (side) => { sfx.score(kind !== 'cpu' || side === 'L'); },
+      game: () => sfx.game(),
       over: (w) => this.onOver(w),
-    }));
+    }), { bestOf });
+    this.match.intentFor = (side, b, pad) => {
+      if (side === 'R' && this.cpu) return this.cpu.intent(b, pad, this.match.pads.L);
+      return humanIntent(b, pad, side, (side === 'L' ? this.left : this.right).mods);
+    };
     $('you-hint').textContent = kind === 'cpu'
-      ? 'Tú eres la pala roja (izquierda). Ratón, dedo, W/S o flechas.'
-      : 'Izquierda: W/S · Derecha: ↑/↓ · En táctil, cada uno en su mitad.';
-    setHud(this.names, this.match.score, kind === 'cpu' ? 'vs CPU' : 'Local');
+      ? 'Pala roja. Mueve la pala hacia la red al golpear para dar potencia; hacia atrás o C para cortar.'
+      : 'Izq.: WASD, Espacio (fuerte/saque), Q (cortado) · Der.: flechas, Intro (fuerte/saque), Mayús dcha. (cortado)';
   }
-  pointer(x, y, touch) {
-    if (this.kind === 'cpu' || x < W / 2) this.left.pointer = y;
-    else this.right.pointer = y;
+  pointer(p) {
+    if (this.kind === 'cpu' || p.x < 0) this.left.pointer = p;
+    else this.right.pointer = p;
   }
   togglePause() {
     if (this.match.phase === 'over') return;
@@ -479,31 +703,42 @@ class LocalMode {
     if (this.paused) overlay({ title: 'Pausa', text: 'Pulsa P o Esc para continuar.', primary: 'Continuar', onPrimary: () => this.togglePause() });
     else hideOverlay();
   }
-  tick(dt) {
+  tick(dtReal) {
     if (this.paused) return;
-    this.left.update(dt);
-    if (this.cpu) this.cpu.update(dt, this.match, this.right); else this.right.update(dt);
+    const dt = dtReal * TIME_SCALE;
     const m = this.match;
-    m.ly = this.left.y; m.lvel = this.left.vel;
-    m.ry = this.right.y; m.rvel = this.right.vel;
+    const serving = m.phase === 'serve';
+    this.left.update(dt, serving && m.server === 'L');
+    copyPad(this.left, m.pads.L);
+    if (this.cpu) this.cpu.update(dt, m, m.pads.R);
+    else { this.right.update(dt, serving && m.server === 'R'); copyPad(this.right, m.pads.R); }
+    this.chargeL.update(dtReal, this.left.powerHeld, serving && m.server === 'L', (p) => m.requestServe('L', p));
+    if (!this.cpu) this.chargeR.update(dtReal, this.right.powerHeld || touchActive, serving && m.server === 'R', (p) => m.requestServe('R', p));
     m.tick(dt);
   }
   view() {
     const m = this.match;
-    setHud(this.names, m.score);
+    setHud(this.names, m, this.kind === 'cpu' ? `vs CPU · ${bestOfLabel(m.bestOf)}` : `Local · ${bestOfLabel(m.bestOf)}`);
+    const humanServer = m.phase === 'serve' && (m.server === 'L' || !this.cpu);
+    const charger = m.server === 'L' ? this.chargeL : this.chargeR;
     return {
-      ball: m.ball, ly: m.ly, ry: m.ry, serving: m.phase === 'countdown' ? m.server : null,
-      ballVisible: m.phase === 'playing' || m.phase === 'countdown',
-      ...bannerFor(m, this.names),
+      ball: m.ball, pads: m.pads,
+      serving: m.phase === 'serve' || m.phase === 'toss' ? m.server : null,
+      ballVisible: m.phase !== 'gamebreak' && m.phase !== 'over',
+      aim: humanServer ? solveServe(m.ball, m.server, charger.charge ?? 0.35, serveAim(m.pads[m.server].y)) : null,
+      charge: humanServer ? charger.charge : null, chargePad: m.pads[m.server],
+      hint: this.cpu ? serveHint(m, 'L', isTouchDevice()) : (m.phase === 'serve' ? `Saca ${this.names[m.server]}` : ''),
+      ...viewText(m, this.names),
     };
   }
   onOver(w) {
     const youWin = this.kind === 'cpu' && w === 'L';
-    if (this.kind === 'cpu') (youWin ? sfx.win : sfx.lose)(); else sfx.win();
-    const s = this.match.score;
+    (this.kind !== 'cpu' || youWin ? sfx.win : sfx.lose)();
+    const g = this.match.games, s = this.match.score;
+    const res = this.match.bestOf > 1 ? `Juegos ${g.L} – ${g.R} (último juego ${s.L} – ${s.R})` : `Resultado: ${s.L} – ${s.R}`;
     overlay({
-      title: this.kind === 'cpu' ? (youWin ? '¡Has ganado! 🏆' : 'Gana la CPU') : `¡Gana ${this.names[w]}! 🏆`,
-      text: `Resultado final: ${s.L} – ${s.R}`,
+      title: this.kind === 'cpu' ? (youWin ? '¡Has ganado el partido! 🏆' : 'Gana la CPU') : `¡Gana ${this.names[w]}! 🏆`,
+      text: res,
       primary: 'Revancha',
       onPrimary: () => { hideOverlay(); this.match.rematch(); },
     });
@@ -511,61 +746,70 @@ class LocalMode {
   destroy() {}
 }
 
-/** Modo online: el host simula, el invitado predice. */
+function copyPad(ctrl, pad) {
+  pad.px = ctrl.px; pad.py = ctrl.py; pad.x = ctrl.x; pad.y = ctrl.y; pad.vx = ctrl.vx; pad.vy = ctrl.vy;
+}
+
 class OnlineMode {
-  constructor(session, isHost, myName) {
+  constructor(session, isHost, myName, bestOf) {
     this.s = session;
     this.isHost = isHost;
     this.side = isHost ? 'L' : 'R';
     this.names = isHost ? { L: myName, R: 'Rival' } : { L: 'Rival', R: myName };
-    this.ctrl = new PaddleControl(ALL_UP, ALL_DOWN);
-    this.remoteY = (H - PADDLE_H) / 2;
-    this.remoteShown = this.remoteY;
+    this.ctrl = new PaddleControl(this.side, KEYMAPS.single);
+    this.charger = new ServeCharger();
+    this.remote = { x: dirOf(this.side) * (HL + 0.45), y: 0 };
+    this.remoteShown = { ...this.remote };
     this.seq = 0;
     this.sendAcc = 0;
     this.pingAcc = 0;
     this.rtt = 0.1;
-    this.meReady = false;
-    this.rivalReady = false;
+    this.meReady = this.rivalReady = false;
     this.ended = false;
 
-    const scoreHook = (side) => { sfx.score(side === this.side); renderer.kick(8); };
+    const base = {
+      score: (side) => sfx.score(side === this.side),
+      game: () => sfx.game(),
+      over: (w) => this.onOver(w),
+    };
     if (isHost) {
-      this.match = new Match(fxHooks({ score: scoreHook, over: (w) => this.onOver(w) }), { remoteRight: true });
+      this.match = new Match(fxHooks(base), { remoteRight: true, bestOf });
+      this.match.intentFor = (side, b, pad) => humanIntent(b, pad, side, this.ctrl.mods);
     } else {
       this.view_ = new GuestView(fxHooks({
-        score: scoreHook,
-        over: (w) => this.onOver(w),
+        ...base,
         restart: () => { hideOverlay(); this.meReady = this.rivalReady = false; },
       }), (m) => this.s.send(m));
-      this.ctrl.y = (H - PADDLE_H) / 2;
     }
 
     session.on('message', (m) => this.onMessage(m));
     session.on('disconnected', () => this.onDisconnect());
-    session.on('error', () => {}); // errores tardíos de señalización: no afectan a la partida
-    session.send({ t: 'hello', name: myName, v: 1 });
+    session.on('error', () => {});
+    session.send({ t: 'hello', name: myName, v: 2 });
 
-    $('you-hint').textContent = isHost
-      ? 'Tú eres la pala roja (izquierda). Ratón, dedo, W/S o flechas.'
-      : 'Tú eres la pala negra (derecha). Ratón, dedo, W/S o flechas.';
-    setHud(this.names, { L: 0, R: 0 }, `Sala ${session.code}`);
+    $('you-hint').textContent = (isHost ? 'Eres la pala roja (izquierda). ' : 'Eres la pala negra (derecha). ')
+      + 'Mueve la pala hacia la red al golpear para dar potencia; hacia atrás o C para cortar.';
   }
 
-  pointer(x, y) { this.ctrl.pointer = y; }
+  get state() { return this.isHost ? this.match : this.view_; }
+  pointer(p) { this.ctrl.pointer = p; }
 
   onMessage(m) {
     switch (m.t) {
       case 'hello':
       case 'welcome':
-        this.names[this.isHost ? 'R' : 'L'] = (String(m.name || 'Rival')).slice(0, 14);
-        if (m.t === 'hello') this.s.send({ t: 'welcome', name: this.names[this.side] });
-        toast(`${this.names[this.isHost ? 'R' : 'L']} se ha unido`);
+        if (m.v !== 2) { toast('Tu rival usa otra versión del juego: recargad los dos la página.'); }
+        this.names[this.isHost ? 'R' : 'L'] = String(m.name || 'Rival').slice(0, 14);
+        if (m.t === 'hello') this.s.send({ t: 'welcome', name: this.names[this.side], v: 2 });
+        toast(`${this.names[other(this.side)]} se ha unido`);
         break;
-      case 'p': this.remoteY = clampPaddle(+m.y || 0); break;
+      case 'p':
+        if (Number.isFinite(m.x) && Number.isFinite(m.y)) this.remote = { x: m.x, y: m.y };
+        break;
       case 's': if (!this.isHost) this.view_.onSnapshot(m); break;
       case 'hit': if (this.isHost) this.match.applyRemoteHit(m); break;
-      case 'miss': if (this.isHost) this.match.applyRemoteMiss(m); break;
+      case 'volley': if (this.isHost) this.match.applyRemoteVolley(m); break;
+      case 'serve': if (this.isHost) this.match.requestServe('R', m.p); break;
       case 'ping': this.s.send({ t: 'pong', ts: m.ts }); if (m.rtt) this.setRtt(m.rtt); break;
       case 'pong': this.setRtt((performance.now() - m.ts) / 1000, true); break;
       case 'rematch':
@@ -584,28 +828,37 @@ class OnlineMode {
     if (this.view_) this.view_.rtt = this.rtt;
   }
 
-  tick(dt) {
-    this.ctrl.update(dt);
-    // Suavizado de la pala remota (llega a ~60 Hz por red).
-    this.remoteShown += (this.remoteY - this.remoteShown) * Math.min(1, dt * 30);
+  tick(dtReal) {
+    const dt = dtReal * TIME_SCALE;
+    const st = this.state;
+    const myServe = st.phase === 'serve' && st.server === this.side;
+    this.ctrl.update(dt, myServe);
+    const k = Math.min(1, dt * 40);
+    this.remoteShown.x += (this.remote.x - this.remoteShown.x) * k;
+    this.remoteShown.y += (this.remote.y - this.remoteShown.y) * k;
+
+    this.charger.update(dtReal, this.ctrl.powerHeld, myServe, (p) => {
+      if (this.isHost) this.match.requestServe('L', p);
+      else this.s.send({ t: 'serve', p });
+    });
 
     if (this.isHost) {
       const m = this.match;
-      m.ly = this.ctrl.y; m.lvel = this.ctrl.vel;
-      m.ry = this.remoteShown;
+      copyPad(this.ctrl, m.pads.L);
+      const R = m.pads.R;
+      R.px = R.x; R.py = R.y; R.x = this.remoteShown.x; R.y = this.remoteShown.y;
       m.tick(dt);
     } else {
-      this.view_.tick(dt, this.ctrl.y, this.ctrl.vel);
+      this.view_.tick(dt, this.ctrl, this.ctrl.mods);
     }
 
-    // Envío de red a 60 Hz
-    this.sendAcc += dt;
+    this.sendAcc += dtReal;
     if (this.sendAcc >= 1 / 60) {
       this.sendAcc = 0;
       if (this.isHost) this.s.sendState(this.match.snapshot(++this.seq));
-      else this.s.sendState({ t: 'p', y: Math.round(this.ctrl.y * 10) / 10 });
+      else this.s.sendState({ t: 'p', x: Math.round(this.ctrl.x * 1000) / 1000, y: Math.round(this.ctrl.y * 1000) / 1000 });
     }
-    this.pingAcc += dt;
+    this.pingAcc += dtReal;
     if (this.pingAcc >= 1) {
       this.pingAcc = 0;
       this.s.send({ t: 'ping', ts: performance.now(), rtt: this.isHost ? 0 : this.rtt });
@@ -613,33 +866,33 @@ class OnlineMode {
   }
 
   view() {
-    const info = `Sala ${this.s.code} · ${Math.round(this.rtt * 1000)} ms`;
-    if (this.isHost) {
-      const m = this.match;
-      setHud(this.names, m.score, info);
-      return {
-        ball: m.ball, ly: m.ly, ry: m.ry, serving: m.phase === 'countdown' ? m.server : null,
-        ballVisible: m.phase === 'playing' || m.phase === 'countdown',
-        ...bannerFor(m, this.names),
-      };
-    }
-    const v = this.view_;
-    setHud(this.names, v.score, info);
+    const st = this.state;
+    setHud(this.names, st, `Sala ${this.s.code} · ${Math.round(this.rtt * 1000)} ms · ${bestOfLabel(st.bestOf)}`);
+    const myServe = st.phase === 'serve' && st.server === this.side;
+    const pads = this.isHost
+      ? this.match.pads
+      : { L: this.view_.hostPad, R: { x: this.ctrl.x, y: this.ctrl.y } };
+    const ball = this.isHost ? this.match.ball : this.view_.renderBall;
     return {
-      ball: v.renderBall, ly: v.ly, ry: this.ctrl.y, serving: v.phase === 'countdown' ? v.server : null,
-      ballVisible: v.phase === 'playing' || v.phase === 'countdown',
-      ...bannerFor(v, this.names),
+      ball, pads,
+      serving: st.phase === 'serve' || st.phase === 'toss' ? st.server : null,
+      ballVisible: st.phase !== 'gamebreak' && st.phase !== 'over' && st.phase !== 'waiting',
+      aim: myServe ? solveServe(ball, this.side, this.charger.charge ?? 0.35, serveAim(this.ctrl.y)) : null,
+      charge: myServe ? this.charger.charge : null, chargePad: this.ctrl,
+      hint: myServe ? serveHint(st, this.side, isTouchDevice()) : (st.phase === 'serve' ? `Saca ${this.names[st.server]}` : ''),
+      ...viewText(st, this.names),
     };
   }
 
   onOver(w) {
     const won = w === this.side;
     (won ? sfx.win : sfx.lose)();
-    const s = this.isHost ? this.match.score : this.view_.score;
+    const st = this.state;
     this.meReady = false;
+    const res = st.bestOf > 1 ? `Juegos ${st.games.L} – ${st.games.R} (último juego ${st.score.L} – ${st.score.R})` : `Resultado: ${st.score.L} – ${st.score.R}`;
     overlay({
-      title: won ? '¡Has ganado! 🏆' : `Gana ${this.names[w]}`,
-      text: `Resultado final: ${s.L} – ${s.R}`,
+      title: won ? '¡Has ganado el partido! 🏆' : `Gana ${this.names[w]}`,
+      text: res,
       primary: 'Revancha',
       onPrimary: () => {
         this.meReady = true;
@@ -658,7 +911,6 @@ class OnlineMode {
       this.meReady = this.rivalReady = false;
       hideOverlay();
     }
-    // El invitado cierra el overlay al recibir la nueva instantánea (hook restart).
   }
 
   onDisconnect(byRival = false) {
@@ -680,7 +932,7 @@ class OnlineMode {
 }
 
 // ============================================================
-//  Bucle principal (paso fijo de 120 Hz + render en rAF)
+//  Bucle principal: simulación a paso fijo (120 Hz) + render en rAF
 // ============================================================
 let last = performance.now();
 let acc = 0;
@@ -705,9 +957,10 @@ function startMode(m) {
 }
 
 // ============================================================
-//  Flujo de menú / salas
+//  Menú y salas
 // ============================================================
 let pendingSession = null;
+const selectedBestOf = () => +$('best-of').value || 1;
 
 function backToMenu() {
   hideOverlay();
@@ -715,7 +968,12 @@ function backToMenu() {
   if (pendingSession) { pendingSession.destroy(); pendingSession = null; }
   setJoinBusy(false);
   show('menu');
-  history.replaceState(null, '', location.pathname);
+  history.replaceState(null, '', location.pathname + devParams());
+}
+
+function devParams() {
+  const sig = new URLSearchParams(location.search).get('signal');
+  return sig ? `?signal=${sig}` : '';
 }
 
 function setJoinBusy(busy) {
@@ -724,7 +982,7 @@ function setJoinBusy(busy) {
   $('btn-join').textContent = busy ? 'Conectando…' : 'Unirse';
 }
 
-function shareUrl(code) { return `${location.origin}${location.pathname}?sala=${code}`; }
+const shareUrl = (code) => `${location.origin}${location.pathname}?sala=${code}`;
 
 function createRoom() {
   sfx.unlock();
@@ -733,17 +991,18 @@ function createRoom() {
   $('lobby-error').textContent = '';
   $('lobby-title').textContent = 'Creando sala…';
   $('lobby-code').textContent = '·····';
+  $('lobby-format').textContent = `Partido ${bestOfLabel(selectedBestOf())}`;
   show('lobby');
   const name = playerName();
+  const bestOf = selectedBestOf();
   const s = hostRoom((code) => {
     $('lobby-title').textContent = 'Sala creada';
     $('lobby-code').textContent = code;
-    history.replaceState(null, '', `?sala=${code}&host=1`);
   });
   pendingSession = s;
   s.on('connected', () => {
     pendingSession = null;
-    startMode(new OnlineMode(s, true, name));
+    startMode(new OnlineMode(s, true, name, bestOf));
   });
   s.on('error', (err) => { $('lobby-error').textContent = errorText(err); });
 }
@@ -761,8 +1020,7 @@ function joinByCode(raw) {
   s.on('connected', () => {
     pendingSession = null;
     setJoinBusy(false);
-    history.replaceState(null, '', `?sala=${code}`);
-    startMode(new OnlineMode(s, false, name));
+    startMode(new OnlineMode(s, false, name, 1));
   });
   s.on('error', (err) => {
     s.destroy();
@@ -785,20 +1043,21 @@ async function copy(text, okMsg) {
   catch { prompt('Copia esto:', text); }
 }
 
-// ============================================================
-//  Arranque
-// ============================================================
 function init() {
   renderer = new Renderer(canvas);
-  try { $('name').value = localStorage.getItem('pp-name') || ''; } catch {}
+  try {
+    $('name').value = localStorage.getItem('pp-name') || '';
+    const bo = localStorage.getItem('pp-bestof'); if (bo) $('best-of').value = bo;
+  } catch {}
+  $('best-of').addEventListener('change', () => { try { localStorage.setItem('pp-bestof', $('best-of').value); } catch {} });
   $('btn-mute').textContent = sfx.muted ? '🔇' : '🔊';
 
   $('btn-host').onclick = createRoom;
   $('btn-join').onclick = () => joinByCode($('join-code').value);
   $('join-code').addEventListener('input', (e) => { e.target.value = normalizeCode(e.target.value); });
   $('join-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') joinByCode(e.target.value); });
-  $('btn-cpu').onclick = () => { sfx.unlock(); saveName(); startMode(new LocalMode('cpu', $('cpu-level').value)); };
-  $('btn-local').onclick = () => { sfx.unlock(); saveName(); startMode(new LocalMode('local')); };
+  $('btn-cpu').onclick = () => { sfx.unlock(); saveName(); startMode(new LocalMode('cpu', $('cpu-level').value, selectedBestOf())); };
+  $('btn-local').onclick = () => { sfx.unlock(); saveName(); startMode(new LocalMode('local', null, selectedBestOf())); };
   $('btn-lobby-cancel').onclick = backToMenu;
   $('btn-leave').onclick = backToMenu;
   $('btn-mute').onclick = toggleMute;
@@ -806,23 +1065,19 @@ function init() {
   $('btn-copy-link').onclick = async () => {
     const url = shareUrl($('lobby-code').textContent);
     if (navigator.share) {
-      try { await navigator.share({ title: 'Ping Pong Online', text: '¿Echamos un ping pong? Únete a mi sala:', url }); return; } catch (e) { if (e.name === 'AbortError') return; }
+      try { await navigator.share({ title: 'Ping Pong Online', text: '¿Echamos un partido de ping pong? Únete a mi sala:', url }); return; }
+      catch (e) { if (e.name === 'AbortError') return; }
     }
     copy(url, 'Enlace copiado');
   };
 
-  // Enlace de invitación: ?sala=CODIGO
   const params = new URLSearchParams(location.search);
   const code = normalizeCode(params.get('sala'));
-  if (code.length === 5 && !params.has('host')) {
+  if (code.length === 5) {
     $('join-code').value = code;
-    $('btn-join').textContent = 'Unirse';
     $('btn-join').classList.add('primary', 'pulse');
-    $('menu-error').textContent = '';
     $('name').focus();
     toast(`Te han invitado a la sala ${code}. Escribe tu nombre y pulsa «Unirse».`);
-  } else if (params.has('host')) {
-    history.replaceState(null, '', location.pathname);
   }
 
   if (typeof Peer === 'undefined') {
@@ -838,3 +1093,4 @@ init();
 
 // Acceso de depuración desde la consola (y para pruebas automáticas).
 window.__pingpong = { get mode() { return mode; } };
+window.__pingpong.CpuBrain = CpuBrain;

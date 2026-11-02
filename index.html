@@ -18,11 +18,21 @@
     <section id="menu" class="screen active" aria-labelledby="title">
       <div class="card">
         <h1 id="title"><span aria-hidden="true">🏓</span> Ping Pong <em>Online</em></h1>
-        <p class="tagline">Crea una sala, pasa el código a un amigo y a jugar. Partidos a 11 con las reglas del tenis de mesa.</p>
+        <p class="tagline">Tenis de mesa con el reglamento oficial: mesa reglamentaria, botes, red, efectos y saque. Crea una sala, pásale el código a un amigo y a jugar.</p>
 
         <label class="field">
           <span>Tu nombre</span>
           <input id="name" type="text" maxlength="14" placeholder="Jugador" autocomplete="nickname">
+        </label>
+
+        <label class="field">
+          <span>Formato del partido</span>
+          <select id="best-of">
+            <option value="1">1 juego a 11 puntos</option>
+            <option value="3" selected>Al mejor de 3 juegos</option>
+            <option value="5">Al mejor de 5 juegos (oficial)</option>
+            <option value="7">Al mejor de 7 juegos</option>
+          </select>
         </label>
 
         <div class="block">
@@ -49,13 +59,22 @@
         </div>
 
         <details class="help">
-          <summary>Controles y reglas</summary>
+          <summary>Cómo se juega</summary>
+          <h3>Controles</h3>
           <ul>
-            <li><b>Ratón / dedo:</b> mueve la pala arrastrando por tu mitad del campo.</li>
-            <li><b>Teclado:</b> <kbd>W</kbd>/<kbd>S</kbd> o <kbd>↑</kbd>/<kbd>↓</kbd>. En 2 jugadores locales: izquierda <kbd>W</kbd>/<kbd>S</kbd>, derecha <kbd>↑</kbd>/<kbd>↓</kbd>.</li>
-            <li><kbd>P</kbd> o <kbd>Esc</kbd> pausa (solo modos sin conexión). <kbd>M</kbd> silencia.</li>
-            <li>Gana quien llegue a <b>11</b> con <b>2 de ventaja</b>. El saque cambia cada 2 puntos y en el 10-10 cambia en cada punto.</li>
-            <li>Dónde golpea la pelota en la pala cambia el ángulo, y mover la pala al golpear le da efecto. Cada golpe la acelera.</li>
+            <li><b>Ratón / dedo:</b> la pala sigue el puntero por tu lado de la mesa (puedes acercarte, alejarte y moverte a los lados).</li>
+            <li><b>Teclado:</b> <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> o flechas.</li>
+            <li><b>Golpe:</b> es automático cuando la pelota llega a tu pala. Si mueves la pala <b>hacia la red</b> al golpear, das potencia y liftado; si la mueves <b>hacia atrás</b> (o mantienes <kbd>C</kbd> o el clic derecho), haces un golpe <b>cortado</b>. Si mantienes <kbd>Espacio</kbd> o el clic, el golpe es fuerte, y si la bola viene alta, rematas.</li>
+            <li><b>Dirección:</b> golpear con el lado izquierdo o derecho de la pala, o moverla en lateral, cambia el ángulo y da efecto lateral. Golpear con el borde es arriesgado.</li>
+            <li><b>Saque:</b> mantén <kbd>Espacio</kbd>, el clic o el dedo para cargar la fuerza y suelta (más fuerza = saque más largo). La posición lateral de tu pala decide hacia dónde va; verás la trayectoria marcada.</li>
+            <li><kbd>P</kbd>/<kbd>Esc</kbd> pausa (sin conexión) · <kbd>M</kbd> silencio. Dos jugadores en el mismo teclado: izquierda <kbd>WASD</kbd> + <kbd>Espacio</kbd>/<kbd>Q</kbd>, derecha flechas + <kbd>Intro</kbd>/<kbd>Mayús</kbd> derecha.</li>
+          </ul>
+          <h3>Reglamento (ITTF)</h3>
+          <ul>
+            <li>El <b>saque</b> se lanza al aire desde detrás de la línea de fondo y debe <b>botar primero en tu campo</b> y después en el del rival. Si toca la red y entra, es <b>let</b> y se repite.</li>
+            <li>Hay que dejar <b>botar una vez</b> la pelota en tu campo antes de devolverla: si la tocas sobre la mesa sin que haya botado (volea), pierdes el punto.</li>
+            <li>Pierdes el punto si tu golpe va a la <b>red</b>, sale <b>fuera</b> o bota en tu propio campo, o si la pelota <b>bota dos veces</b> en tu campo.</li>
+            <li>Los juegos son a <b>11 puntos con 2 de ventaja</b>. El saque cambia cada 2 puntos y, desde el 10-10, en cada punto. Quien sacó primero en un juego recibe primero en el siguiente.</li>
           </ul>
         </details>
       </div>
@@ -67,6 +86,7 @@
       <div class="card center">
         <h2 id="lobby-title">Creando sala…</h2>
         <div id="lobby-code" class="code" aria-label="Código de sala">·····</div>
+        <p id="lobby-format" class="format"></p>
         <p id="lobby-hint">Pásale este código a tu amigo o compártele el enlace.</p>
         <div class="row center">
           <button id="btn-copy-code" class="btn small">Copiar código</button>
@@ -81,13 +101,13 @@
     <!-- PARTIDA -->
     <section id="game" class="screen">
       <header class="hud">
-        <div class="player left"><span class="swatch red"></span><span id="name-l">Jugador 1</span><b id="score-l">0</b></div>
+        <div class="player left"><span class="swatch red"></span><span class="pname"><span id="name-l">Jugador 1</span><small id="games-l"></small></span><b id="score-l">0</b></div>
         <div class="hud-mid">
           <span id="hud-info"></span>
           <button id="btn-mute" class="icon" aria-label="Silenciar" title="Silenciar (M)">🔊</button>
           <button id="btn-leave" class="icon" aria-label="Salir" title="Salir">✕</button>
         </div>
-        <div class="player right"><b id="score-r">0</b><span id="name-r">Jugador 2</span><span class="swatch black"></span></div>
+        <div class="player right"><b id="score-r">0</b><span class="pname"><span id="name-r">Jugador 2</span><small id="games-r"></small></span><span class="swatch black"></span></div>
       </header>
       <div class="stage">
         <canvas id="canvas" width="1000" height="600" aria-label="Mesa de ping pong"></canvas>

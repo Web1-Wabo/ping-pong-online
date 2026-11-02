@@ -79,13 +79,16 @@ class Session {
       if (!this.isHost && m?.t === 'full') { clearTimeout(this._timeout); this.emit('error', { type: 'full' }); return; }
       this.emit('message', m);
     });
-    conn.on('close', () => this._lost());
-    conn.on('error', () => this._lost());
+    // Solo cuentan las conexiones vigentes (un reintento deja conexiones viejas cerrándose).
+    const lost = () => { if (conn === this.ctrl || conn === this.state) this._lost(); };
+    conn.on('close', lost);
+    conn.on('error', lost);
   }
   _checkReady() {
     if (this.ready && !this._readyFired) {
       this._readyFired = true;
       clearTimeout(this._timeout);
+      clearTimeout(this._retry);
       this.emit('connected');
     }
   }
@@ -96,6 +99,8 @@ class Session {
 
   destroy() {
     this.closed = true;
+    clearTimeout(this._timeout);
+    clearTimeout(this._retry);
     try { this.ctrl?.close(); } catch {}
     try { this.state?.close(); } catch {}
     try { this.peer?.destroy(); } catch {}
@@ -150,15 +155,26 @@ export function joinRoom(code) {
   s.code = code;
   const peer = new Peer(PEER_OPTS);
   s.peer = peer;
-  peer.on('open', () => {
+  const connect = () => {
     const target = PREFIX + code;
     s.ctrl = peer.connect(target, { label: 'ctrl', reliable: true, serialization: 'json' });
     s.state = peer.connect(target, { label: 'state', reliable: false, serialization: 'json' });
     [s.ctrl, s.state].forEach((c) => { s._wire(c); c.on('open', () => s._checkReady()); });
+  };
+  peer.on('open', () => {
+    connect();
+    // Si la negociación WebRTC se atasca, reintenta una vez.
+    s._retry = setTimeout(() => {
+      if (s._readyFired || s.closed) return;
+      const old = [s.ctrl, s.state];
+      s.accepted = false;
+      connect();
+      old.forEach((c) => { try { c.close(); } catch {} });
+    }, 7000);
     s._timeout = setTimeout(() => {
       if (!s._readyFired && !s.closed) s.emit('error', { type: 'timeout', message: 'No se pudo establecer la conexión directa con el rival (tiempo agotado). Puede que una red muy restrictiva lo esté bloqueando.' });
-    }, 15000);
+    }, 18000);
   });
-  peer.on('error', (err) => { clearTimeout(s._timeout); if (!s._readyFired) s.emit('error', err); });
+  peer.on('error', (err) => { clearTimeout(s._timeout); clearTimeout(s._retry); if (!s._readyFired) s.emit('error', err); });
   return s;
 }
